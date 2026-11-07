@@ -1,0 +1,31 @@
+# Secrets
+.env
+*.env
+
+# Virtual environments
+.venv/
+myenv/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Local databases and vector store
+chatbot.db
+chatbot.db-shm
+chatbot.db-wal
+legal_db/
+
+# Legal documents (copyright / size) - add your own locally
+data/*.pdf
+data/*.txt
+!data/README.txt
+
+# Old backups (contain a leaked API key reference)
+chatbot_backend_old.py
+frontend_old.py
+
+# Notebooks and scratch files
+*.ipynb
+.ipynb_checkpoints/

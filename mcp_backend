@@ -1,0 +1,189 @@
+# mcp_backend.py
+import asyncio
+import os
+import threading
+from typing import Annotated, TypedDict
+
+import aiosqlite
+import requests
+from dotenv import load_dotenv
+from langchain_community.tools import DuckDuckGoSearchRun
+from langchain_core.messages import BaseMessage
+from langchain_core.tools import tool
+from langchain_google_genai import ChatGoogleGenerativeAI
+from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+
+load_dotenv()
+
+# ------------------------------------------------------------------
+# 0. Background event loop (so Streamlit's sync code can run async work)
+# ------------------------------------------------------------------
+_ASYNC_LOOP = asyncio.new_event_loop()
+
+
+def _run_loop():
+    asyncio.set_event_loop(_ASYNC_LOOP)
+    _ASYNC_LOOP.run_forever()
+
+
+_ASYNC_THREAD = threading.Thread(target=_run_loop, daemon=True)
+_ASYNC_THREAD.start()
+
+
+def submit_async_task(coro):
+    """Schedule a coroutine on the backend loop (non-blocking). Returns a Future."""
+    return asyncio.run_coroutine_threadsafe(coro, _ASYNC_LOOP)
+
+
+def run_async(coro):
+    """Run a coroutine on the backend loop and wait for its result."""
+    return submit_async_task(coro).result()
+
+
+# ------------------------------------------------------------------
+# 1. LLM
+# ------------------------------------------------------------------
+llm = ChatGoogleGenerativeAI(
+    model="gemini-3.8-flash",  # make sure this is a valid model ID
+    temperature=0,
+)
+
+# ------------------------------------------------------------------
+# 2. Tools
+# ------------------------------------------------------------------
+search_tool = DuckDuckGoSearchRun(region="us-en")
+
+
+@tool
+def calculator(first_num: float, second_num: float, operation: str) -> dict:
+    """
+    Perform a basic arithmetic operation on two numbers.
+    Supported operations: add, sub, mul, div
+    """
+    try:
+        if operation == "add":
+            result = first_num + second_num
+        elif operation == "sub":
+            result = first_num - second_num
+        elif operation == "mul":
+            result = first_num * second_num
+        elif operation == "div":
+            if second_num == 0:
+                return {"error": "Division by zero is not allowed"}
+            result = first_num / second_num
+        else:
+            return {"error": f"Unsupported operation '{operation}'"}
+
+        return {
+            "first_num": first_num,
+            "second_num": second_num,
+            "operation": operation,
+            "result": result,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@tool
+def get_stock_price(symbol: str) -> dict:
+    """
+    Fetch latest stock price for a given symbol (e.g. 'AAPL', 'TSLA')
+    using Alpha Vantage.
+    """
+    api_key = os.getenv("ALPHA_VANTAGE_API_KEY")
+    url = (
+        "https://www.alphavantage.co/query"
+        f"?function=GLOBAL_QUOTE&symbol={symbol}&apikey={api_key}"
+    )
+    r = requests.get(url, timeout=15)
+    return r.json()
+
+
+# ---- MCP tools (optional) ----------------------------------------
+# Fill this in with your own MCP server(s). Leave empty to skip MCP.
+# Examples:
+# MCP_SERVERS = {
+#     "my_server": {
+#         "transport": "streamable_http",
+#         "url": "https://your-mcp-server.example.com/mcp",
+#     },
+#     "local_server": {
+#         "transport": "stdio",
+#         "command": "python",
+#         "args": ["C:/path/to/your_mcp_server.py"],
+#     },
+# }
+MCP_SERVERS: dict = {}
+
+mcp_tools = []
+if MCP_SERVERS:
+    try:
+        from langchain_mcp_adapters.client import MultiServerMCPClient
+
+        _mcp_client = MultiServerMCPClient(MCP_SERVERS)
+        mcp_tools = run_async(_mcp_client.get_tools())
+    except Exception as exc:
+        print(f"[mcp_backend] Could not load MCP tools: {exc}")
+
+tools = [search_tool, get_stock_price, calculator, *mcp_tools]
+llm_with_tools = llm.bind_tools(tools)
+
+
+# ------------------------------------------------------------------
+# 3. State
+# ------------------------------------------------------------------
+class ChatState(TypedDict):
+    messages: Annotated[list[BaseMessage], add_messages]
+
+
+# ------------------------------------------------------------------
+# 4. Nodes (async, because MCP tools are async-only)
+# ------------------------------------------------------------------
+async def chat_node(state: ChatState):
+    """LLM node that may answer or request a tool call."""
+    response = await llm_with_tools.ainvoke(state["messages"])
+    return {"messages": [response]}
+
+
+tool_node = ToolNode(tools)
+
+
+# ------------------------------------------------------------------
+# 5. Checkpointer (async SQLite, created INSIDE the background loop)
+# ------------------------------------------------------------------
+async def _init_checkpointer():
+    conn = await aiosqlite.connect("chatbot.db")
+    return AsyncSqliteSaver(conn)
+
+
+checkpointer = run_async(_init_checkpointer())
+
+# ------------------------------------------------------------------
+# 6. Graph
+# ------------------------------------------------------------------
+graph = StateGraph(ChatState)
+graph.add_node("chat_node", chat_node)
+graph.add_node("tools", tool_node)
+
+graph.add_edge(START, "chat_node")
+graph.add_conditional_edges("chat_node", tools_condition)
+graph.add_edge("tools", "chat_node")
+
+chatbot = graph.compile(checkpointer=checkpointer)
+
+
+# ------------------------------------------------------------------
+# 7. Helpers
+# ------------------------------------------------------------------
+async def _alist_threads():
+    all_threads = set()
+    async for checkpoint in checkpointer.alist(None):
+        all_threads.add(checkpoint.config["configurable"]["thread_id"])
+    return list(all_threads)
+
+
+def retrieve_all_threads():
+    return run_async(_alist_threads())
