@@ -94,7 +94,7 @@ if "queued_question" not in st.session_state:
 add_thread(st.session_state["thread_id"])
 
 # ============================ Sidebar ============================
-st.sidebar.title("⚖️ AI Legal Study Assistant")
+st.sidebar.title("AI Legal Study Assistant")
 
 mode_label = st.sidebar.radio("Mode", ["Research", "Study", "Draft"])
 mode = mode_label.lower()
@@ -147,6 +147,7 @@ if user_input:
         "configurable": {"thread_id": st.session_state["thread_id"]},
         "metadata": {"thread_id": st.session_state["thread_id"]},
         "run_name": "chat_turn",
+        "recursion_limit": 10,
     }
 
     # Per-turn inputs reset sources/verification for this question

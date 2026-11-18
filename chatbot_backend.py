@@ -1,3 +1,4 @@
+import time
 import asyncio
 import json
 import os
@@ -20,7 +21,7 @@ from legal_tools import get_legal_tools
 load_dotenv()
 
 # ------------------------------------------------------------------
-# 0. Dedicated async loop for backend tasks (unchanged from your version)
+# 0. Dedicated async loop for backend tasks 
 # ------------------------------------------------------------------
 _ASYNC_LOOP = asyncio.new_event_loop()
 _ASYNC_THREAD = threading.Thread(target=_ASYNC_LOOP.run_forever, daemon=True)
@@ -33,7 +34,7 @@ def _submit_async(coro):
 
 def run_async(coro):
     return _submit_async(coro).result()
-
+ 
 
 def submit_async_task(coro):
     """Schedule a coroutine on the backend event loop."""
@@ -45,8 +46,8 @@ def submit_async_task(coro):
 # ------------------------------------------------------------------
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
-llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0)
-verifier_llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0)
+llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0, max_retries=2, timeout=60)
+verifier_llm = ChatGoogleGenerativeAI(model=MODEL_NAME, temperature=0, max_retries=2, timeout=60)
 
 # ------------------------------------------------------------------
 # 2. Tools (see legal_tools.py)
@@ -167,7 +168,9 @@ async def agent_node(state: ChatState):
     """LLM node: answers or requests a tool call, using the mode's system prompt."""
     mode = state.get("mode", "research")
     msgs = [SystemMessage(content=build_system_prompt(mode))] + state["messages"]
+    t = time.time()
     response = await llm_with_tools.ainvoke(msgs)
+    print(f"[agent] {time.time()-t:.1f}s | tokens={response.usage_metadata} | tool_calls={len(response.tool_calls)}")
     return {"messages": [response]}
 
 
@@ -176,13 +179,14 @@ _base_tool_node = ToolNode(tools)
 
 async def tools_node(state: ChatState, config: RunnableConfig):
     """Run tools, then record which sources were retrieved for the UI."""
+    t = time.time()
     result = await _base_tool_node.ainvoke(state, config)
+    print(f"[tools] {time.time()-t:.1f}s")
     new_sources = []
     for m in result["messages"]:
         if isinstance(m, ToolMessage):
             new_sources.extend(_sources_from_tool_message(m))
     return {"messages": result["messages"], "sources": state.get("sources", []) + new_sources}
-
 
 class VerifyResult(BaseModel):
     unsupported: list[str] = Field(
@@ -198,6 +202,7 @@ async def verifier_node(state: ChatState):
 
     answer = _text(state["messages"][-1].content)
     sources_text = "\n\n".join(_text(m.content) for m in _current_turn_tool_messages(state["messages"]))
+    t = time.time()
     try:
         check = await verifier_llm.with_structured_output(VerifyResult).ainvoke(
             "You are a strict legal citation checker.\n"
@@ -206,6 +211,7 @@ async def verifier_node(state: ChatState):
             "If everything is supported, return an empty list.\n\n"
             f"ANSWER:\n{answer}\n\nSOURCES:\n{sources_text[:30000] or '(no sources retrieved)'}"
         )
+        print(f"[verifier] {time.time()-t:.1f}s")
         unsupported = list(check.unsupported) if check else []
         return {"verified": len(unsupported) == 0, "unsupported": unsupported}
     except Exception as exc:
